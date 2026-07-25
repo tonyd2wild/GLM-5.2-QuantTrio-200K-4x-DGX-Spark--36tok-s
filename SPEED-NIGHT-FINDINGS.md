@@ -210,3 +210,81 @@ every lever, not assumed:
 4. **RDMA one-shot allreduce** — +5–10, weeks.
 
 The honest headline: **k5 at 36 peak is the proven ceiling for one-night work on this stack.** Speed-Night 3 converted "untested ideas" into a measured map — every cheap lever is exhausted, and each big bet now has an exact, quantified requirement.
+
+---
+
+# Addendum — evaluating ciprianveg's v18 stack on 4 nodes (2026-07-25)
+
+[ciprianveg/gb10-glm-5.2](https://github.com/ciprianveg/gb10-glm-5.2) publishes a v18 stack for
+**8× GB10** (1,329 t/s prefill, 66 t/s peak decode) with prebuilt GHCR images. We tested
+`ghcr.io/ciprianveg/gb10-glm-5.2:v18-prod` on our **4-node** cluster to see what transfers.
+
+## What transfers, what doesn't
+
+His image runs fine on 4 nodes: it accepts our native `mp` multi-node args
+(`--nnodes/--node-rank/--master-addr/--headless`), TP=4, and our weights. Note its
+`ENTRYPOINT` is `[vllm]`, so the container command starts at `serve …`, not `vllm serve …`.
+
+**Measured, 4 nodes, fp8_ds_mla, gmu 0.91, abliterated weights (same shape as base):**
+
+| | this recipe (v0.23.1 pin) | v18-prod |
+|---|---|---|
+| decode, warm | **32–33 t/s steady** | 36 t/s initially, **degrading to ~28** |
+| KV pool | **200,064** | 142,263 (**−29%**) |
+| max context @ gmu 0.91 | **200K** | ~140K |
+| MTP mean acceptance | 2.75–4.75 | **4.85** |
+| MTP draft acceptance rate | ~43–53% | **96.2%** |
+| worker wedge under load | occurs | **still occurs** (`shm_broadcast` post-startup) |
+
+**Conclusion: not worth adopting wholesale on 4 nodes.** His headline numbers are largely
+node-count physics — prefill and aggregate concurrency scale with nodes; his *average* decode
+(35 t/s, tg1500) is in the same band as ours. On 4 nodes his runtime (V2 runner + B12X indexer +
+his graph config) reserves ~29% more memory, costing 60K of context, and it did not fix the
+long-context worker wedge.
+
+## The one finding worth stealing: MTP draft quantization mapping
+
+The standout delta was **draft acceptance: ~43% → 96.2%**. His recipe passes an explicit
+quantization for the MTP draft, ours does not:
+
+```
+# his
+--speculative-config '{"method":"mtp","quantization":"compressed-tensors",
+  "draft_attention_backend":"B12X_MLA_SPARSE","num_speculative_tokens":4,
+  "draft_tensor_parallel_size":1}'
+
+# ours
+--speculative-config '{"method":"mtp","num_speculative_tokens":4,
+  "draft_tensor_parallel_size":1,"attention_backend":"FLASHMLA_SPARSE"}'
+```
+
+paired with his `mods/fix-mtp-quant-packed-mapping` (packed_modules_mapping for
+`fused_qkv_a_proj` + `gate_up_proj` in the MTP draft's quant config).
+
+**Why this matters:** decode t/s ≈ mean_acceptance ÷ step_time. If the draft is being loaded
+with a wrong/absent quant mapping, acceptance is depressed and every accepted token costs more
+draft work. This is a **candidate one-line-plus-mod change to THIS recipe** — untested here as of
+this writing, and the honest caveat is that our 43% baseline was measured on the abliterated
+weights (whose draft is aligned to the non-abliterated distribution), so part of that gap may be
+weight-specific rather than mapping-specific. **Needs an A/B on the base checkpoint before it goes
+in the recipe.**
+
+## Ops lesson (cost us two misdiagnoses)
+
+After any crash/teardown, the workers' NFS mount of the weights share can drop. Symptom: workers
+`Exited (1)` with `HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo'`
+(empty weights path), head hangs at `world_size=N rank=0 distributed_init`. We first read this as
+a v18 compile/rendezvous failure — it was dying workers. **Always remount and verify the share on
+every worker before relaunching:**
+
+```bash
+sudo umount /var/tmp/models 2>/dev/null
+sudo mount -t nfs -o vers=3 <HEAD_FABRIC_IP>:/var/tmp/models /var/tmp/models
+ls /var/tmp/models/hub/<weights-dir>/config.json   # must succeed on every worker
+```
+
+## Credit
+
+[ciprianveg](https://github.com/ciprianveg/gb10-glm-5.2) for publishing the v18 stack, the
+prebuilt images, and the mod set — including the decode-aware prefill scheduler already merged
+into this repo (PR #7), and the MTP quant-mapping fix documented above.
